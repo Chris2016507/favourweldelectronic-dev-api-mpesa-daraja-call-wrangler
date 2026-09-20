@@ -3,185 +3,98 @@ import { httpServerHandler } from "cloudflare:node";
 import express from "express";
 
 const app = express();
+app.use(express.json({ limit: "32kb" }));
 
-// Middleware to parse JSON bodies
-app.use(express.json());
+// Values are configured as Cloudflare Worker secrets, never committed here.
+const config = env as unknown as Record<string, string | undefined>;
 
-// Health check endpoint
-app.get("/", (req, res) => {
-  res.json({ message: "Express.js running on Cloudflare Workers!" });
+app.get("/", (_req, res) => {
+  res.json({ service: "FAVOURWELD ELECTRONICS Daraja API", status: "ok" });
 });
 
-// GET all members
-app.get("/api/members", async (req, res) => {
-  try {
-    const { results } = await env.DB.prepare(
-      "SELECT * FROM members ORDER BY joined_date DESC"
-    ).all();
+app.get("/api/health", (_req, res) => res.json({ success: true }));
 
-    res.json({ success: true, members: results });
+function required(name: string): string {
+  const value = config[name];
+  if (!value) throw new Error(`Missing Cloudflare secret: ${name}`);
+  return value;
+}
+
+function darajaBaseUrl(): string {
+  return config.DARAJA_ENV === "production"
+    ? "https://api.safaricom.co.ke"
+    : "https://sandbox.safaricom.co.ke";
+}
+
+function normalizePhone(value: unknown): string | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  let phone = String(value).replace(/[\s+()-]/g, "");
+  if (phone.startsWith("0")) phone = `254${phone.slice(1)}`;
+  if (phone.startsWith("7") || phone.startsWith("1")) phone = `254${phone}`;
+  return /^254[17]\d{8}$/.test(phone) ? phone : null;
+}
+
+async function getAccessToken(): Promise<string> {
+  const key = required("DARAJA_CONSUMER_KEY");
+  const secret = required("DARAJA_CONSUMER_SECRET");
+  const credentials = btoa(`${key}:${secret}`);
+  const response = await fetch(`${darajaBaseUrl()}/oauth/v1/generate?grant_type=client_credentials`, {
+    headers: { Authorization: `Basic ${credentials}` },
+  });
+  const data = await response.json() as { access_token?: string; errorMessage?: string };
+  if (!response.ok || !data.access_token) {
+    throw new Error(data.errorMessage || "Daraja authentication failed");
+  }
+  return data.access_token;
+}
+
+app.post("/api/mpesa/stkpush", async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.phone);
+    const amount = Number(req.body?.amount);
+    if (!phone) return res.status(400).json({ success: false, error: "Enter a valid Kenyan M-PESA phone number, e.g. 0712345678." });
+    if (!Number.isSafeInteger(amount) || amount < 1 || amount > 250000) {
+      return res.status(400).json({ success: false, error: "Amount must be a whole number between KSh 1 and KSh 250,000." });
+    }
+
+    const shortcode = required("DARAJA_SHORTCODE");
+    const passkey = required("DARAJA_PASSKEY");
+    const callbackUrl = required("DARAJA_CALLBACK_URL");
+    const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+    const password = btoa(`${shortcode}${passkey}${timestamp}`);
+    const token = await getAccessToken();
+    const response = await fetch(`${darajaBaseUrl()}/mpesa/stkpush/v1/processrequest`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        BusinessShortCode: shortcode,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: config.DARAJA_TRANSACTION_TYPE || "CustomerPayBillOnline",
+        Amount: amount,
+        PartyA: phone,
+        PartyB: shortcode,
+        PhoneNumber: phone,
+        CallBackURL: callbackUrl,
+        AccountReference: String(req.body?.accountReference || "FAVOURWELD").slice(0, 12),
+        TransactionDesc: String(req.body?.description || "FAVOURWELD payment").slice(0, 13),
+      }),
+    });
+    const data = await response.json() as Record<string, unknown>;
+    if (!response.ok) return res.status(502).json({ success: false, error: "Daraja could not start the payment request.", details: data });
+    return res.status(200).json({ success: true, message: "STK Push request submitted. Check the phone for the M-PESA prompt.", data });
   } catch (error) {
-    res.status(500).json({ success: false, error: "Failed to fetch members" });
+    const message = error instanceof Error ? error.message : "Unexpected payment error";
+    const missingSecret = message.startsWith("Missing Cloudflare secret:");
+    return res.status(missingSecret ? 503 : 502).json({ success: false, error: missingSecret ? message : "Unable to initiate M-PESA payment. Check Daraja configuration and try again." });
   }
 });
 
-// GET a single member by ID
-app.get("/api/members/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { results } = await env.DB.prepare(
-      "SELECT * FROM members WHERE id = ?"
-    )
-      .bind(id)
-      .all();
-
-    if (results.length === 0) {
-      return res
-        .status(404)
-        .json({ success: false, error: "Member not found" });
-    }
-
-    res.json({ success: true, member: results[0] });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Failed to fetch member" });
-  }
-});
-
-// PUT - Update a member
-app.put("/api/members/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, email } = req.body;
-
-    // Validate input
-    if (!name && !email) {
-      return res.status(400).json({
-        success: false,
-        error: "At least one field (name or email) is required",
-      });
-    }
-
-    // Basic email validation if provided (simplified for tutorial purposes)
-    // For production, consider using a validation library or more comprehensive checks
-    if (email && (!email.includes("@") || !email.includes("."))) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid email format",
-      });
-    }
-
-    // Build dynamic update query
-    const updates: string[] = [];
-    const values: any[] = [];
-
-    if (name) {
-      updates.push("name = ?");
-      values.push(name);
-    }
-    if (email) {
-      updates.push("email = ?");
-      values.push(email);
-    }
-
-    values.push(id);
-
-    const result = await env.DB.prepare(
-      `UPDATE members SET ${updates.join(", ")} WHERE id = ?`
-    )
-      .bind(...values)
-      .run();
-
-    if (result.meta.changes === 0) {
-      return res
-        .status(404)
-        .json({ success: false, error: "Member not found" });
-    }
-
-    res.json({ success: true, message: "Member updated successfully" });
-  } catch (error: any) {
-    if (error.message?.includes("UNIQUE constraint failed")) {
-      return res.status(409).json({
-        success: false,
-        error: "Email already exists",
-      });
-    }
-    res.status(500).json({ success: false, error: "Failed to update member" });
-  }
-});
-
-// POST - Create a new member
-app.post("/api/members", async (req, res) => {
-  try {
-    const { name, email } = req.body;
-
-    // Validate input
-    if (!name || !email) {
-      return res.status(400).json({
-        success: false,
-        error: "Name and email are required",
-      });
-    }
-
-    // Basic email validation (simplified for tutorial purposes)
-    // For production, consider using a validation library or more comprehensive checks
-    if (!email.includes("@") || !email.includes(".")) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid email format",
-      });
-    }
-
-    const joined_date = new Date().toISOString().split("T")[0];
-
-    const result = await env.DB.prepare(
-      "INSERT INTO members (name, email, joined_date) VALUES (?, ?, ?)"
-    )
-      .bind(name, email, joined_date)
-      .run();
-
-    if (result.success) {
-      res.status(201).json({
-        success: true,
-        message: "Member created successfully",
-        id: result.meta.last_row_id,
-      });
-    } else {
-      res
-        .status(500)
-        .json({ success: false, error: "Failed to create member" });
-    }
-  } catch (error: any) {
-    // Handle unique constraint violation
-    if (error.message?.includes("UNIQUE constraint failed")) {
-      return res.status(409).json({
-        success: false,
-        error: "Email already exists",
-      });
-    }
-    res.status(500).json({ success: false, error: "Failed to create member" });
-  }
-});
-
-// DELETE - Delete a member
-app.delete("/api/members/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const result = await env.DB.prepare("DELETE FROM members WHERE id = ?")
-      .bind(id)
-      .run();
-
-    if (result.meta.changes === 0) {
-      return res
-        .status(404)
-        .json({ success: false, error: "Member not found" });
-    }
-
-    res.json({ success: true, message: "Member deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Failed to delete member" });
-  }
+// Daraja sends asynchronous transaction results to this endpoint.
+// Persist and validate callback results before treating an order as paid.
+app.post("/api/mpesa/callback", (req, res) => {
+  console.log("Daraja callback received", JSON.stringify(req.body));
+  res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
 });
 
 app.listen(3000);
